@@ -60,42 +60,29 @@ BASELINE_PARAMS = {
 # ==============================================================================
 # 2. 實驗參數設計 (Experiment Parameter Grid)
 # ==============================================================================
-# 根據會議紀錄: 固定參數為 θ, hf, s, c
-# 實驗逐一改變這些參數的值，觀察對廠商決策的影響
-
 EXPERIMENT_CONFIGS = {
-    # 實驗 1: θ (theta) 的影響 - misfit cost 折扣因子
-    # θ 越大 → 線上與實體的體驗差距越大
+    # θ 越大 → 線上 misfit = θ·t_H·d 越大 → 線上優勢越小
     'theta': {
         'param_name': 'PARAM_THETA',
-        'values': [0.2, 0.4, 0.6, 0.8, 1.0],
+        'values': [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
         'label': 'θ (Theta)',
-        'description': 'Misfit cost 折扣因子: θ 越小，線上購物的不確定性損失越低',
+        'description': 'Misfit cost 折扣因子: θ 越大，線上 misfit 越接近實體（線上優勢越小）；θ 越小，線上購物不確定性損失越低',
     },
-
-    # 實驗 2: hf (消費者拜訪成本) 的影響
-    # 拜訪成本越高 → 消費者越偏好線上
     'hf': {
         'param_name': 'PARAM_H_H',
-        'values': [10.0, 25.0, 50.0, 75.0, 100.0],
+        'values': [5.0, 10.0, 20.0, 30.0, 50.0, 70.0, 100.0],
         'label': 'hf (高拜訪成本)',
         'description': '消費者拜訪實體店面成本: hf 越高，消費者越傾向線上購買',
     },
-
-    # 實驗 3: s (運費) 的影響
-    # 運費越高 → 線上購物成本越高 → 可能促進 BOPS
     's': {
         'param_name': 'PARAM_S',
-        'values': [5.0, 15.0, 25.0, 40.0, 60.0],
+        'values': [5.0, 10.0, 15.0, 20.0, 25.0, 35.0, 50.0, 60.0],
         'label': 's (運費)',
         'description': '運費: s 越高，消費者線上購物成本越高，可能促進 BOPS 採用',
     },
-
-    # 實驗 4: c (BOPS 運營管理成本) 的影響
-    # BOPS 成本越高 → 廠商越不願開 BOPS
     'c': {
         'param_name': 'PARAM_C',
-        'values': [0.5, 2.0, 5.0, 10.0, 20.0],
+        'values': [0.5, 1.0, 2.0, 5.0, 8.0, 10.0, 15.0, 20.0],
         'label': 'c (BOPS 運營成本)',
         'description': 'BOPS 運營管理成本: c 越高，廠商開啟 BOPS 的意願越低',
     },
@@ -109,7 +96,7 @@ TRAIN_CONFIG = {
     'learning_rate_critic': 0.001,
     'discount_factor': 0.95,
     'tau': 0.005,
-    'num_episodes': 4000,       # 每組實驗訓練回合數 (可依需求調整)
+    'num_episodes': 4000,
     'batch_size': 256,
     'buffer_size': 200000,
     'max_steps_per_episode': 10,
@@ -118,6 +105,12 @@ TRAIN_CONFIG = {
     'min_exploration_noise': 0.01,
     'NUM_AGENTS': 2,
     'ACTION_SIZE': 3,           # (Price, BOPS, Phi)
+    # 收斂檢測
+    'convergence_window': 300,  # 檢查最後 N 回合
+    'convergence_threshold': 0.005,  # reward std < 此值視為收斂
+    'min_episodes': 2000,       # 至少跑這麼多回合才開始檢測收斂
+    # 重複實驗
+    'num_seeds': 3,             # 每組參數重複幾次取均值 (設 1 = 只跑一次)
 }
 
 GLOBAL_STATE_SIZE = TRAIN_CONFIG['ACTION_SIZE'] * TRAIN_CONFIG['NUM_AGENTS']
@@ -126,7 +119,7 @@ ACTION_SIZE = TRAIN_CONFIG['ACTION_SIZE']
 NUM_AGENTS = TRAIN_CONFIG['NUM_AGENTS']
 
 # ==============================================================================
-# 4. 網路定義 (同原始模型)
+# 4. 網路定義
 # ==============================================================================
 class ActorNetwork(nn.Module):
     def __init__(self, state_size, action_size):
@@ -208,7 +201,7 @@ class ReplayBuffer:
 # ==============================================================================
 # 6. MADDPG Trainer
 # ==============================================================================
-class MADDPG:
+class MADDPGTrainer:
     def __init__(self, num_agents, state_size, action_size, total_action_size, cfg):
         self.num_agents = num_agents
         self.agents = [
@@ -257,8 +250,12 @@ class MADDPG:
 
             if self.train_step_count % 2 == 0:
                 preds_all = []
-                for other in self.agents:
-                    preds_all.append(scale_action_torch(other.actor(states_t), params))
+                for j, other in enumerate(self.agents):
+                    pred = other.actor(states_t)
+                    scaled_pred = scale_action_torch(pred, params)
+                    if j != i:
+                        scaled_pred = scaled_pred.detach()
+                    preds_all.append(scaled_pred)
                 preds_all_t = torch.cat(preds_all, dim=1)
                 actor_loss = -agent.critic(states_t, preds_all_t).mean()
                 agent.actor_optimizer.zero_grad()
@@ -272,7 +269,7 @@ class MADDPG:
 
 
 # ==============================================================================
-# 7. 環境函數 (參數化版本)
+# 7. 環境函數
 # ==============================================================================
 def scale_action(action, params):
     """將 [0,1] 縮放回真實環境數值"""
@@ -292,7 +289,7 @@ def scale_action_torch(action_tensor, params):
 
 
 def calculate_profits(action1, action2, params):
-    """計算利潤 (Hotelling 模型) - 接受參數字典"""
+    """計算利潤 (Hotelling 模型)"""
     p1, bops1, phi1 = action1
     p2, bops2, phi2 = action2
 
@@ -357,20 +354,26 @@ def calculate_profits(action1, action2, params):
 
 
 # ==============================================================================
-# 8. 單次實驗訓練函數
+# 8. 單次實驗訓練函數 (加入收斂檢測)
 # ==============================================================================
-def run_single_experiment(params, cfg, verbose=False):
+def run_single_experiment(params, cfg, seed=None, verbose=False):
     """
     針對一組環境參數訓練 MADDPG 並回傳均衡結果。
-    Returns:
-        result_dict: 包含均衡時的 Price, BOPS, Phi, Profit, Demand 等
+    加入收斂檢測以提早停止。
     """
-    maddpg = MADDPG(NUM_AGENTS, GLOBAL_STATE_SIZE, ACTION_SIZE, TOTAL_ACTION_SIZE, cfg)
+    if seed is not None:
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        random.seed(seed)
+
+    maddpg = MADDPGTrainer(NUM_AGENTS, GLOBAL_STATE_SIZE, ACTION_SIZE, TOTAL_ACTION_SIZE, cfg)
     current_state = np.zeros(GLOBAL_STATE_SIZE)
     current_noise = cfg['exploration_noise_start']
 
     history_rewards = []
-    last_actions = None
+    # 記錄每回合的動作（用於取均值）
+    history_actions = []
+    converged_at = cfg['num_episodes']
 
     for episode in range(cfg['num_episodes']):
         step_rewards = np.zeros(NUM_AGENTS)
@@ -416,42 +419,78 @@ def run_single_experiment(params, cfg, verbose=False):
 
         avg_rewards = step_rewards / cfg['max_steps_per_episode']
         history_rewards.append(avg_rewards)
+
+        # 記錄無雜訊 actor 輸出
+        with torch.no_grad():
+            st = torch.FloatTensor(current_state).unsqueeze(0).to(device)
+            clean_raw = [a.actor(st).cpu().numpy()[0] for a in maddpg.agents]
+        clean_env = [scale_action(a, params) for a in clean_raw]
+        history_actions.append(clean_env)
+
         current_noise = max(cfg['min_exploration_noise'], current_noise * cfg['noise_decay'])
-        last_actions = env_actions
 
         if verbose and (episode + 1) % 500 == 0:
-            ea = env_actions
+            ea = clean_env
             print(f"  Ep {episode + 1} | "
                   f"F1: P={ea[0][0]:.1f}, B={int(ea[0][1] > 0.5)}, φ={ea[0][2]:.2f} | "
                   f"F2: P={ea[1][0]:.1f}, B={int(ea[1][1] > 0.5)}, φ={ea[1][2]:.2f}")
 
+        # 收斂檢測
+        conv_win = cfg.get('convergence_window', 300)
+        conv_thresh = cfg.get('convergence_threshold', 0.005)
+        min_ep = cfg.get('min_episodes', 2000)
+        if episode >= min_ep and len(history_rewards) >= conv_win:
+            recent = np.array(history_rewards[-conv_win:])
+            if np.std(recent[:, 0]) < conv_thresh and np.std(recent[:, 1]) < conv_thresh:
+                converged_at = episode + 1
+                if verbose:
+                    print(f"  ✓ 收斂於 Episode {converged_at}")
+                break
+
     # --- 取最後 200 回合的均值作為均衡結果 ---
-    with torch.no_grad():
-        st = torch.FloatTensor(current_state).unsqueeze(0).to(device)
-        eq_raw = [a.actor(st).cpu().numpy()[0] for a in maddpg.agents]
-    eq_actions = [scale_action(a, params) for a in eq_raw]
-    profit1, profit2, demand1, demand2 = calculate_profits(eq_actions[0], eq_actions[1], params)
+    avg_window = min(200, len(history_actions))
+    recent_actions = history_actions[-avg_window:]
+
+    eq_p1 = np.mean([a[0][0] for a in recent_actions])
+    eq_bops1 = np.mean([a[0][1] for a in recent_actions])
+    eq_phi1 = np.mean([a[0][2] for a in recent_actions])
+    eq_p2 = np.mean([a[1][0] for a in recent_actions])
+    eq_bops2 = np.mean([a[1][1] for a in recent_actions])
+    eq_phi2 = np.mean([a[1][2] for a in recent_actions])
+
+    eq_action1 = [eq_p1, eq_bops1, eq_phi1]
+    eq_action2 = [eq_p2, eq_bops2, eq_phi2]
+    profit1, profit2, demand1, demand2 = calculate_profits(eq_action1, eq_action2, params)
+
+    # 收斂穩定性
+    recent_rewards = np.array(history_rewards[-avg_window:])
+    reward_std = np.std(recent_rewards, axis=0)
 
     result = {
         'firm1': {
-            'price': eq_actions[0][0],
-            'bops': int(eq_actions[0][1] > 0.5),
-            'bops_raw': eq_actions[0][1],
-            'phi': eq_actions[0][2],
+            'price': eq_p1,
+            'bops': int(eq_bops1 > 0.5),
+            'bops_raw': eq_bops1,
+            'phi': eq_phi1,
             'profit': profit1,
             'demand_store': demand1[0],
             'demand_online': demand1[1],
             'demand_bops': demand1[2],
         },
         'firm2': {
-            'price': eq_actions[1][0],
-            'bops': int(eq_actions[1][1] > 0.5),
-            'bops_raw': eq_actions[1][1],
-            'phi': eq_actions[1][2],
+            'price': eq_p2,
+            'bops': int(eq_bops2 > 0.5),
+            'bops_raw': eq_bops2,
+            'phi': eq_phi2,
             'profit': profit2,
             'demand_store': demand2[0],
             'demand_online': demand2[1],
             'demand_bops': demand2[2],
+        },
+        'convergence': {
+            'converged_at': converged_at,
+            'reward_std_f1': float(reward_std[0]),
+            'reward_std_f2': float(reward_std[1]),
         },
         'history_rewards': np.array(history_rewards),
     }
@@ -459,21 +498,26 @@ def run_single_experiment(params, cfg, verbose=False):
 
 
 # ==============================================================================
-# 9. 實驗執行器
+# 9. 實驗執行器 (支援多 seed 取均值)
 # ==============================================================================
-def run_experiment_suite(experiment_key, verbose=True):
+def run_experiment_suite(experiment_key, cfg=None, verbose=True):
     """
-    針對指定實驗（如 'theta', 'hf', 's', 'c'），依序跑不同參數值。
+    針對指定實驗，依序跑不同參數值。
+    支援 num_seeds > 1 時多次重複取均值。
     """
+    if cfg is None:
+        cfg = TRAIN_CONFIG
     exp_cfg = EXPERIMENT_CONFIGS[experiment_key]
     param_name = exp_cfg['param_name']
     values = exp_cfg['values']
     label = exp_cfg['label']
+    num_seeds = cfg.get('num_seeds', 1)
 
     print(f"\n{'=' * 70}")
     print(f"實驗: {label} 的影響")
     print(f"描述: {exp_cfg['description']}")
     print(f"參數範圍: {values}")
+    print(f"每組重複次數: {num_seeds}")
     print(f"{'=' * 70}")
 
     results = []
@@ -482,11 +526,26 @@ def run_experiment_suite(experiment_key, verbose=True):
         params[param_name] = val
         print(f"\n--- {label} = {val} ---")
         t0 = time.time()
-        result = run_single_experiment(params, TRAIN_CONFIG, verbose=verbose)
+
+        if num_seeds == 1:
+            result = run_single_experiment(params, cfg, verbose=verbose)
+            result['param_value'] = val
+            results.append(result)
+        else:
+            seed_results = []
+            for s in range(num_seeds):
+                print(f"  Seed {s + 1}/{num_seeds}...")
+                r = run_single_experiment(params, cfg, seed=42 + s, verbose=False)
+                seed_results.append(r)
+            # 取均值
+            avg_result = _average_seed_results(seed_results)
+            avg_result['param_value'] = val
+            # 保留第一次的 history_rewards 用於畫收斂曲線
+            avg_result['history_rewards'] = seed_results[0]['history_rewards']
+            results.append(avg_result)
+
         elapsed = time.time() - t0
-        result['param_value'] = val
-        results.append(result)
-        f1, f2 = result['firm1'], result['firm2']
+        f1, f2 = results[-1]['firm1'], results[-1]['firm2']
         print(f"  結果 ({elapsed:.1f}s):")
         print(f"    Firm 1: Price={f1['price']:.1f}, BOPS={f1['bops']}, "
               f"φ={f1['phi']:.3f}, Profit={f1['profit']:.4f}")
@@ -496,112 +555,210 @@ def run_experiment_suite(experiment_key, verbose=True):
     return results
 
 
+def _average_seed_results(seed_results):
+    """將多個 seed 的結果取均值"""
+    keys = ['price', 'bops_raw', 'phi', 'profit',
+            'demand_store', 'demand_online', 'demand_bops']
+    result = {'firm1': {}, 'firm2': {}}
+    for firm in ['firm1', 'firm2']:
+        for k in keys:
+            vals = [r[firm][k] for r in seed_results]
+            result[firm][k] = float(np.mean(vals))
+            result[firm][f'{k}_std'] = float(np.std(vals))
+        result[firm]['bops'] = int(result[firm]['bops_raw'] > 0.5)
+    return result
+
+
 # ==============================================================================
-# 10. 視覺化函數
+# 10. 視覺化函數 (折線趨勢圖)
 # ==============================================================================
 def plot_experiment_results(results, experiment_key, save_dir='results'):
-    """為單一實驗的結果繪製比較圖"""
+    """為單一實驗繪製折線趨勢圖 - 觀察參數如何影響各決策"""
     os.makedirs(save_dir, exist_ok=True)
     exp_cfg = EXPERIMENT_CONFIGS[experiment_key]
     label = exp_cfg['label']
     x_vals = [r['param_value'] for r in results]
 
     fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-    fig.suptitle(f'廠商決策 vs {label} 的敏感度分析', fontsize=16, fontweight='bold')
+    fig.suptitle(f'敏感度分析: {label} 對廠商決策的影響', fontsize=16, fontweight='bold')
 
-    # --- Row 1: 決策變數 ---
+    # 檢查是否有 std 資訊（多 seed）
+    has_std = 'price_std' in results[0].get('firm1', {})
+
+    def _plot_line(ax, x, y1, y2, ylabel, title, y1_std=None, y2_std=None):
+        ax.plot(x, y1, 'o-', label='Firm 1', color='#2196F3', linewidth=2, markersize=6)
+        ax.plot(x, y2, 's--', label='Firm 2', color='#F44336', linewidth=2, markersize=6)
+        if y1_std is not None:
+            ax.fill_between(x, np.array(y1) - np.array(y1_std),
+                           np.array(y1) + np.array(y1_std), alpha=0.15, color='#2196F3')
+            ax.fill_between(x, np.array(y2) - np.array(y2_std),
+                           np.array(y2) + np.array(y2_std), alpha=0.15, color='#F44336')
+        ax.set_xlabel(label, fontsize=12)
+        ax.set_ylabel(ylabel, fontsize=11)
+        ax.set_title(title, fontsize=13, fontweight='bold')
+        ax.legend(fontsize=10)
+        ax.grid(True, alpha=0.3)
+
     # 1.1 定價策略
-    ax = axes[0, 0]
-    ax.plot(x_vals, [r['firm1']['price'] for r in results], 'o-', label='Firm 1', color='#2196F3', linewidth=2)
-    ax.plot(x_vals, [r['firm2']['price'] for r in results], 's--', label='Firm 2', color='#F44336', linewidth=2)
-    ax.set_xlabel(label)
-    ax.set_ylabel('均衡價格')
-    ax.set_title('定價策略')
-    ax.legend()
-    ax.grid(True, alpha=0.3)
+    y1 = [r['firm1']['price'] for r in results]
+    y2 = [r['firm2']['price'] for r in results]
+    std1 = [r['firm1'].get('price_std', 0) for r in results] if has_std else None
+    std2 = [r['firm2'].get('price_std', 0) for r in results] if has_std else None
+    _plot_line(axes[0, 0], x_vals, y1, y2, '均衡價格 (p)', '定價策略', std1, std2)
 
     # 1.2 BOPS 策略
-    ax = axes[0, 1]
-    ax.plot(x_vals, [r['firm1']['bops_raw'] for r in results], 'o-', label='Firm 1', color='#2196F3', linewidth=2)
-    ax.plot(x_vals, [r['firm2']['bops_raw'] for r in results], 's--', label='Firm 2', color='#F44336', linewidth=2)
-    ax.axhline(y=0.5, color='gray', linestyle=':', alpha=0.5, label='BOPS 開啟門檻')
-    ax.set_xlabel(label)
-    ax.set_ylabel('BOPS 傾向值')
-    ax.set_title('BOPS 策略 (>0.5 為開啟)')
-    ax.legend()
-    ax.grid(True, alpha=0.3)
+    y1 = [r['firm1']['bops_raw'] for r in results]
+    y2 = [r['firm2']['bops_raw'] for r in results]
+    std1 = [r['firm1'].get('bops_raw_std', 0) for r in results] if has_std else None
+    std2 = [r['firm2'].get('bops_raw_std', 0) for r in results] if has_std else None
+    _plot_line(axes[0, 1], x_vals, y1, y2, 'BOPS 傾向值', 'BOPS 策略 (>0.5 為開啟)', std1, std2)
+    axes[0, 1].axhline(y=0.5, color='gray', linestyle=':', alpha=0.6, linewidth=1.5)
+    axes[0, 1].set_ylim(-0.05, 1.05)
 
     # 1.3 φ 補貼率
-    ax = axes[0, 2]
-    ax.plot(x_vals, [r['firm1']['phi'] for r in results], 'o-', label='Firm 1', color='#2196F3', linewidth=2)
-    ax.plot(x_vals, [r['firm2']['phi'] for r in results], 's--', label='Firm 2', color='#F44336', linewidth=2)
-    ax.set_xlabel(label)
-    ax.set_ylabel('φ (補貼率)')
-    ax.set_title('運費補貼率 φ')
-    ax.legend()
-    ax.grid(True, alpha=0.3)
+    y1 = [r['firm1']['phi'] for r in results]
+    y2 = [r['firm2']['phi'] for r in results]
+    std1 = [r['firm1'].get('phi_std', 0) for r in results] if has_std else None
+    std2 = [r['firm2'].get('phi_std', 0) for r in results] if has_std else None
+    _plot_line(axes[0, 2], x_vals, y1, y2, 'φ (補貼率)', '運費補貼率 φ', std1, std2)
+    axes[0, 2].set_ylim(-0.05, 1.05)
 
-    # --- Row 2: 績效指標 ---
     # 2.1 利潤
-    ax = axes[1, 0]
-    ax.plot(x_vals, [r['firm1']['profit'] for r in results], 'o-', label='Firm 1', color='#2196F3', linewidth=2)
-    ax.plot(x_vals, [r['firm2']['profit'] for r in results], 's--', label='Firm 2', color='#F44336', linewidth=2)
-    ax.set_xlabel(label)
-    ax.set_ylabel('均衡利潤')
-    ax.set_title('廠商利潤')
-    ax.legend()
+    y1 = [r['firm1']['profit'] for r in results]
+    y2 = [r['firm2']['profit'] for r in results]
+    std1 = [r['firm1'].get('profit_std', 0) for r in results] if has_std else None
+    std2 = [r['firm2'].get('profit_std', 0) for r in results] if has_std else None
+    _plot_line(axes[1, 0], x_vals, y1, y2, '均衡利潤 (π)', '廠商利潤', std1, std2)
+
+    # 2.2 Firm 1 通路需求 (堆疊面積圖)
+    ax = axes[1, 1]
+    d_s = [r['firm1']['demand_store'] for r in results]
+    d_o = [r['firm1']['demand_online'] for r in results]
+    d_b = [r['firm1']['demand_bops'] for r in results]
+    ax.stackplot(x_vals, d_s, d_o, d_b,
+                 labels=['實體店', '線上', 'BOPS'],
+                 colors=['#4CAF50', '#FF9800', '#9C27B0'], alpha=0.8)
+    ax.set_xlabel(label, fontsize=12)
+    ax.set_ylabel('需求比例', fontsize=11)
+    ax.set_title('Firm 1 通路需求分佈', fontsize=13, fontweight='bold')
+    ax.legend(loc='upper right', fontsize=9)
     ax.grid(True, alpha=0.3)
 
-    # 2.2 需求分佈 (Firm 1)
-    ax = axes[1, 1]
-    d_store = [r['firm1']['demand_store'] for r in results]
-    d_online = [r['firm1']['demand_online'] for r in results]
-    d_bops = [r['firm1']['demand_bops'] for r in results]
-    ax.bar(range(len(x_vals)), d_store, label='實體', color='#4CAF50', alpha=0.8)
-    ax.bar(range(len(x_vals)), d_online, bottom=d_store, label='線上', color='#FF9800', alpha=0.8)
-    ax.bar(range(len(x_vals)), d_bops, bottom=[a + b for a, b in zip(d_store, d_online)],
-           label='BOPS', color='#9C27B0', alpha=0.8)
-    ax.set_xticks(range(len(x_vals)))
-    ax.set_xticklabels([str(v) for v in x_vals])
-    ax.set_xlabel(label)
-    ax.set_ylabel('需求比例')
-    ax.set_title('Firm 1 通路需求分佈')
-    ax.legend()
-
-    # 2.3 需求分佈 (Firm 2)
+    # 2.3 Firm 2 通路需求
     ax = axes[1, 2]
-    d_store = [r['firm2']['demand_store'] for r in results]
-    d_online = [r['firm2']['demand_online'] for r in results]
-    d_bops = [r['firm2']['demand_bops'] for r in results]
-    ax.bar(range(len(x_vals)), d_store, label='實體', color='#4CAF50', alpha=0.8)
-    ax.bar(range(len(x_vals)), d_online, bottom=d_store, label='線上', color='#FF9800', alpha=0.8)
-    ax.bar(range(len(x_vals)), d_bops, bottom=[a + b for a, b in zip(d_store, d_online)],
-           label='BOPS', color='#9C27B0', alpha=0.8)
-    ax.set_xticks(range(len(x_vals)))
-    ax.set_xticklabels([str(v) for v in x_vals])
-    ax.set_xlabel(label)
-    ax.set_ylabel('需求比例')
-    ax.set_title('Firm 2 通路需求分佈')
-    ax.legend()
+    d_s = [r['firm2']['demand_store'] for r in results]
+    d_o = [r['firm2']['demand_online'] for r in results]
+    d_b = [r['firm2']['demand_bops'] for r in results]
+    ax.stackplot(x_vals, d_s, d_o, d_b,
+                 labels=['實體店', '線上', 'BOPS'],
+                 colors=['#4CAF50', '#FF9800', '#9C27B0'], alpha=0.8)
+    ax.set_xlabel(label, fontsize=12)
+    ax.set_ylabel('需求比例', fontsize=11)
+    ax.set_title('Firm 2 通路需求分佈', fontsize=13, fontweight='bold')
+    ax.legend(loc='upper right', fontsize=9)
+    ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    save_path = os.path.join(save_dir, f'experiment_{experiment_key}.png')
+    save_path = os.path.join(save_dir, f'sensitivity_{experiment_key}.png')
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
     print(f"  圖表已儲存: {save_path}")
 
 
-def plot_summary_table(all_results, save_dir='results'):
-    """繪製所有實驗的摘要比較表"""
+def plot_convergence_check(results, experiment_key, save_dir='results'):
+    """繪製各參數值下的訓練收斂曲線，驗證結果可靠性"""
+    os.makedirs(save_dir, exist_ok=True)
+    exp_cfg = EXPERIMENT_CONFIGS[experiment_key]
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 5))
+    fig.suptitle(f'{exp_cfg["label"]} - 訓練收斂驗證', fontsize=14, fontweight='bold')
+
+    for r in results:
+        rewards = r.get('history_rewards')
+        if rewards is None:
+            continue
+        val = r['param_value']
+        window = 100
+        if len(rewards) >= window:
+            smoothed_1 = np.convolve(rewards[:, 0], np.ones(window) / window, mode='valid')
+            smoothed_2 = np.convolve(rewards[:, 1], np.ones(window) / window, mode='valid')
+        else:
+            smoothed_1, smoothed_2 = rewards[:, 0], rewards[:, 1]
+
+        axes[0].plot(smoothed_1, label=f'{val}', alpha=0.8)
+        axes[1].plot(smoothed_2, label=f'{val}', alpha=0.8)
+
+    for i, title in enumerate(['Firm 1 Reward', 'Firm 2 Reward']):
+        axes[i].set_title(title, fontsize=12)
+        axes[i].set_xlabel('Episode')
+        axes[i].set_ylabel('Smoothed Reward (MA-100)')
+        axes[i].legend(title=exp_cfg['label'], fontsize=8)
+        axes[i].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    save_path = os.path.join(save_dir, f'convergence_{experiment_key}.png')
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"  收斂曲線已儲存: {save_path}")
+
+
+def plot_all_experiments_comparison(all_results, save_dir='results'):
+    """
+    將所有實驗的結果放在同一張圖上做比較：
+    每個子圖對應一個決策/結果變數，每條線對應一個實驗參數。
+    → 方便一次看出哪個參數對哪個決策影響最大。
+    """
     os.makedirs(save_dir, exist_ok=True)
 
-    print(f"\n{'=' * 90}")
-    print(f"{'實驗摘要表':^90}")
-    print(f"{'=' * 90}")
+    metrics = [
+        ('price', '均衡價格 (p)'),
+        ('bops_raw', 'BOPS 傾向值'),
+        ('phi', '運費補貼率 φ'),
+        ('profit', '廠商利潤 π'),
+    ]
+    colors = {'theta': '#2196F3', 'hf': '#F44336', 's': '#4CAF50', 'c': '#FF9800'}
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle('所有實驗的綜合比較 (Firm 1)', fontsize=16, fontweight='bold')
+
+    for ax, (metric, ylabel) in zip(axes.flat, metrics):
+        for exp_key, results in all_results.items():
+            # 正規化 x 軸到 [0, 1] 方便比較
+            x_vals = [r['param_value'] for r in results]
+            x_min, x_max = min(x_vals), max(x_vals)
+            if x_max > x_min:
+                x_norm = [(v - x_min) / (x_max - x_min) for v in x_vals]
+            else:
+                x_norm = x_vals
+            y_vals = [r['firm1'][metric] for r in results]
+            exp_label = EXPERIMENT_CONFIGS[exp_key]['label']
+            ax.plot(x_norm, y_vals, 'o-', label=exp_label,
+                    color=colors.get(exp_key, 'gray'), linewidth=2, markersize=5)
+
+        ax.set_xlabel('正規化參數值 [0→最小, 1→最大]', fontsize=10)
+        ax.set_ylabel(ylabel, fontsize=11)
+        ax.set_title(ylabel, fontsize=12, fontweight='bold')
+        ax.legend(fontsize=9)
+        ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    save_path = os.path.join(save_dir, 'comparison_all_experiments.png')
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"  綜合比較圖已儲存: {save_path}")
+
+
+def plot_summary_table(all_results, save_dir='results'):
+    """輸出摘要表"""
+    os.makedirs(save_dir, exist_ok=True)
+
+    print(f"\n{'=' * 100}")
+    print(f"{'實驗摘要表':^100}")
+    print(f"{'=' * 100}")
     print(f"{'實驗':<12} {'參數值':<10} "
           f"{'F1 Price':<10} {'F1 BOPS':<9} {'F1 φ':<8} {'F1 Profit':<12} "
           f"{'F2 Price':<10} {'F2 BOPS':<9} {'F2 φ':<8} {'F2 Profit':<12}")
-    print(f"{'-' * 90}")
+    print(f"{'-' * 100}")
     for exp_key, results in all_results.items():
         for r in results:
             f1, f2 = r['firm1'], r['firm2']
@@ -612,7 +769,7 @@ def plot_summary_table(all_results, save_dir='results'):
 
 
 def save_results_json(all_results, save_dir='results'):
-    """將結果存為 JSON 以便後續分析"""
+    """將結果存為 JSON"""
     os.makedirs(save_dir, exist_ok=True)
     save_data = {}
     for exp_key, results in all_results.items():
@@ -620,9 +777,13 @@ def save_results_json(all_results, save_dir='results'):
         for r in results:
             entry = {
                 'param_value': r['param_value'],
-                'firm1': {k: float(v) for k, v in r['firm1'].items() if k != 'history_rewards'},
-                'firm2': {k: float(v) for k, v in r['firm2'].items() if k != 'history_rewards'},
+                'firm1': {k: float(v) for k, v in r['firm1'].items()
+                          if not isinstance(v, np.ndarray)},
+                'firm2': {k: float(v) for k, v in r['firm2'].items()
+                          if not isinstance(v, np.ndarray)},
             }
+            if 'convergence' in r:
+                entry['convergence'] = r['convergence']
             exp_data.append(entry)
         save_data[exp_key] = exp_data
 
@@ -637,37 +798,43 @@ def save_results_json(all_results, save_dir='results'):
 # ==============================================================================
 if __name__ == "__main__":
     print("=" * 70)
-    print("MADDPG 實驗設計 - 基於會議紀錄 (2026/1/23)")
+    print("MADDPG 敏感度分析實驗")
     print("=" * 70)
     print(f"研究目的: 觀察 θ, hf, s, c 的變化如何影響廠商決策")
-    print(f"觀察指標: BOPS策略 / 定價策略 / φ 補貼率")
+    print(f"觀察指標: BOPS策略 / 定價策略 / φ 補貼率 / 利潤")
     print(f"基準參數: θ={BASELINE_PARAMS['PARAM_THETA']}, "
           f"hf_H={BASELINE_PARAMS['PARAM_H_H']}, "
           f"s={BASELINE_PARAMS['PARAM_S']}, "
           f"c={BASELINE_PARAMS['PARAM_C']}")
+    print(f"每組重複次數: {TRAIN_CONFIG['num_seeds']}")
     print("=" * 70)
 
     # --- 選擇要跑的實驗 ---
-    # 可以選擇跑全部或單一實驗
     # experiments_to_run = ['theta', 'hf', 's', 'c']  # 全部跑
-    experiments_to_run = ['theta']  # 先跑一個驗證，確認後再跑全部
+    experiments_to_run = ['theta']  # 先跑一個驗證
 
     all_results = {}
     total_start = time.time()
 
     for exp_key in experiments_to_run:
-        results = run_experiment_suite(exp_key, verbose=True)
+        results = run_experiment_suite(exp_key, TRAIN_CONFIG, verbose=True)
         all_results[exp_key] = results
         plot_experiment_results(results, exp_key)
+        plot_convergence_check(results, exp_key)
 
-    # 輸出摘要表
+    # 摘要
     plot_summary_table(all_results)
-
-    # 儲存結果
     save_results_json(all_results)
+
+    # 如果跑了多個實驗，畫綜合比較圖
+    if len(all_results) > 1:
+        plot_all_experiments_comparison(all_results)
 
     total_elapsed = time.time() - total_start
     print(f"\n總計耗時: {total_elapsed / 60:.1f} 分鐘")
-    print("完成！請查看 results/ 資料夾中的圖表與數據。")
-    print("\n提示: 若要跑全部實驗，請將 experiments_to_run 改為:")
-    print("  experiments_to_run = ['theta', 'hf', 's', 'c']")
+    print("完成！請查看 results/ 資料夾。")
+    print("\n提示:")
+    print("  1. 先確認收斂曲線 (convergence_*.png) 是否穩定")
+    print("  2. 再看敏感度圖 (sensitivity_*.png) 的趨勢")
+    print("  3. 若要跑全部: experiments_to_run = ['theta', 'hf', 's', 'c']")
+    print("  4. 若要多次重複取均值: 修改 TRAIN_CONFIG['num_seeds'] = 3")
